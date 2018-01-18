@@ -1,0 +1,209 @@
+	function run_lottery()
+	{
+		$current_time = time();
+
+		// Get all values
+		$points_values = $this->points_all_values();
+
+		// Count number of tickets
+		$sql_array = array(
+			'SELECT'	=> 'COUNT(ticket_id) AS num_tickets',
+			'FROM'		=> array(
+				$this->points_lottery_tickets_table => 'l',
+			),
+		);
+		$sql = $this->db->sql_build_query('SELECT', $sql_array);
+		$result = $this->db->sql_query($sql);
+		$total_tickets = (int) $this->db->sql_fetchfield('num_tickets');
+		$this->db->sql_freeresult($result);
+
+		// Select a random user from tickets table
+		$sql_layer = $this->db->get_sql_layer();
+
+		switch ($sql_layer)
+		{
+			case 'postgres':
+				$order_by = 'RANDOM()';
+			break;
+
+			case 'mssql':
+			case 'mssql_odbc':
+				$order_by = 'NEWID()';
+			break;
+
+			default:
+				$order_by = 'RAND()';
+			break;
+		}
+
+		$sql_array = array(
+			'SELECT'	=> '*',
+			'FROM'		=> array(
+				$this->points_lottery_tickets_table => 'l',
+			),
+			'ORDER_BY'	=> $order_by,
+		);
+		$sql = $this->db->sql_build_query('SELECT', $sql_array);
+		$result = $this->db->sql_query_limit($sql, 1);
+		$random_user_by_tickets = (int) $this->db->sql_fetchfield('user_id');
+		$this->db->sql_freeresult($result);
+
+		if ($total_tickets > 0)
+		{
+			// Generate a random number
+			$rand_base 	= $points_values['lottery_chance'];
+			$rand_value = rand(0, 100);
+
+			// Decide, if the user really wins
+			if ($rand_value <= $rand_base)
+			{
+				$winning_number = $random_user_by_tickets;
+
+				// Select a winner from ticket table
+				$sql_array = array(
+					'SELECT'	=> '*',
+					'FROM'		=> array(
+						USERS_TABLE => 'u',
+					),
+					'WHERE'		=> 'user_id = ' . $winning_number,
+				);
+				$sql = $this->db->sql_build_query('SELECT', $sql_array);
+				$result = $this->db->sql_query($sql);
+				$winner = $this->db->sql_fetchrow($result);
+				$this->db->sql_freeresult($result);
+
+				// Check if lottery is enabled and prepare winner informations
+				$sql = 'SELECT *
+					FROM ' . $this->points_config_table;
+				$result = $this->db->sql_query($sql);
+				$lottery_enabled = $this->db->sql_fetchfield('lottery_enable');
+				$this->db->sql_freeresult($result);
+
+				if ($lottery_enabled = 1)
+				{
+					$winner_notification = $this->number_format_points($points_values['lottery_jackpot']) . ' ' . ($this->config['points_name']) . ' ';
+					$winner_deposit = $this->user->lang['LOTTERY_PM_CASH_ENABLED'];
+					$amount_won = $points_values['lottery_jackpot'];
+				}
+				else
+				{
+					$winner_notification = '';
+					$winner_deposit = '';
+					$amount_won = '';
+				}
+
+				// Update previous winner information
+				$this->set_points_values('lottery_prev_winner', ("'" . $winner['username'] . "'"));
+				$this->set_points_values('lottery_prev_winner_id', $winner['user_id']);
+
+				// Check, if user wants to be informed by PM
+				if ($winner['user_allow_pm'] == 1)
+				{
+					$sql_array = array(
+						'SELECT'	=> '*',
+						'FROM'		=> array(
+							USERS_TABLE => 'u',
+						),
+						'WHERE'		=> 'user_id = ' . $points_values['lottery_pm_from'],
+					);
+					$sql = $this->db->sql_build_query('SELECT', $sql_array);
+					$result = $this->db->sql_query($sql);
+					$pm_sender = $this->db->sql_fetchrow($result);
+					$this->db->sql_freeresult($result);
+
+					// Notify the lucky winner by PM
+					$pm_subject	= $this->user->lang['LOTTERY_PM_SUBJECT'];
+					$pm_text	= sprintf($this->user->lang['LOTTERY_PM_BODY'], $winner_notification, $winner_deposit);
+
+					include_once($this->root_path . 'includes/message_parser.' . $this->php_ext);
+
+					$message_parser = new \parse_message();
+					$message_parser->message = $pm_text;
+					$message_parser->parse(true, true, true, false, false, true, true);
+
+					$pm_data = array(
+						'address_list'		=> array ('u' => array($winner['user_id'] => 'to')),
+						'from_user_id'		=> ($points_values['lottery_pm_from'] == 0) ? $winner['user_id'] : $pm_sender['user_id'],
+						'from_username'		=> ($points_values['lottery_pm_from'] == 0) ? $this->user->lang['LOTTERY_PM_COMMISION'] : $pm_sender['username'],
+						'icon_id'			=> 0,
+						'from_user_ip'		=> '',
+
+						'enable_bbcode'		=> true,
+						'enable_smilies'	=> true,
+						'enable_urls'		=> true,
+						'enable_sig'		=> true,
+
+						'message'		 	=> $message_parser->message,
+						'bbcode_bitfield' 	=> $message_parser->bbcode_bitfield,
+						'bbcode_uid'		=> $message_parser->bbcode_uid,
+					);
+
+					submit_pm('post', $pm_subject, $pm_data, false);
+				}
+
+				// Add new winner to lottery history
+				$sql = 'INSERT INTO ' . $this->points_lottery_history_table . ' ' . $this->db->sql_build_array('INSERT', array(
+					'user_id'			=> (int) $winner['user_id'] ,
+					'user_name'			=> $winner['username'] ,
+					'time'				=> $current_time,
+					'amount'			=> $points_values['lottery_jackpot'],
+				));
+				$this->db->sql_query($sql);
+
+				// Update winners total
+				$this->set_points_values('lottery_winners_total', $points_values['lottery_winners_total'] + 1);
+
+				// Add jackpot to winner
+				$this->add_points((int) $winner['user_id'], $points_values['lottery_jackpot']);
+
+				// Reset jackpot
+				$this->set_points_values('lottery_jackpot', $points_values['lottery_base_amount']);
+			}
+			else
+			{
+				$this->set_points_values('lottery_jackpot', $points_values['lottery_jackpot'] + $points_values['lottery_base_amount']);
+
+				$no_winner = 0;
+
+				$sql = 'INSERT INTO ' . $this->points_lottery_history_table . ' ' . $this->db->sql_build_array('INSERT', array(
+					'user_id'			=> 0,
+					'user_name'			=> $no_winner,
+					'time'				=> $current_time,
+					'amount'			=> 0,
+				));
+				$this->db->sql_query($sql);
+
+				// Update previous winner information
+				$this->set_points_values('lottery_prev_winner', "'" . $no_winner . "'");
+				$this->set_points_values('lottery_prev_winner_id', 0);
+			}
+		}
+
+		// Reset lottery
+
+		// Delete all tickets
+		$sql = 'DELETE FROM ' . $this->points_lottery_tickets_table;
+		$this->db->sql_query($sql);
+
+		// Reset last draw time
+		$check_time = $points_values['lottery_last_draw_time'] + $points_values['lottery_draw_period'];
+		$current_time = time();
+		if ($current_time > $check_time)
+		{
+			while ($check_time < $current_time)
+			{
+				$check_time = $check_time + $points_values['lottery_draw_period'];
+				$check_time++;
+			}
+
+			if ($check_time > $current_time)
+			{
+				$check_time = $check_time - $points_values['lottery_draw_period'];
+				$this->set_points_values('lottery_last_draw_time', $check_time);
+			}
+		}
+		else
+		{
+			$this->set_points_values('lottery_last_draw_time', ($points_values['lottery_last_draw_time'] + $points_values['lottery_draw_period']));
+		}
+	}
